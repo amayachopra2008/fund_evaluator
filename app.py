@@ -91,7 +91,7 @@ if uploaded_file and api_key:
 
                 client = genai.Client(api_key=api_key)
                 try:
-                    response = client.models.generate_content(model="gemini-3.6-flash", contents=llm_prompt)
+                    response = client.models.generate_content(model="gemini-3.5-flash", contents=llm_prompt)
                 except Exception:
                     # Fallback to lite model if flash is under heavy load
                     response = client.models.generate_content(model="gemini-2.5-flash-lite", contents=llm_prompt)
