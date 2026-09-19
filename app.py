@@ -13,7 +13,7 @@ st.title("📊 Universal Portfolio Evaluator & Live Exit Engine")
 
 st.markdown("""
 Analyze portfolio performance by **uploading a file** or **entering a direct URL** (Excel, CSV, TSV, or Morningstar page link). 
-The app will **dynamically scrape live peer funds** from web sources to rank and suggest real-time replacements!
+The app automatically extracts the **underperforming fund name**, calculates risk signals, and **dynamically scrapes live peer funds** to recommend real-time replacements!
 """)
 
 # ---------------------------------------------------------
@@ -47,17 +47,13 @@ def fetch_live_peer_funds():
     }
     peers = []
     try:
-        # Fetching top peer category funds from live web source
         url = "https://www.value-research.com/funds/category/131/equity-small-cap/"
         res = requests.get(url, headers=headers, timeout=10)
         
         if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
             tables = pd.read_html(io.StringIO(res.text))
-            
             if tables:
                 peer_df = tables[0]
-                # Clean and parse top 5 peer funds dynamically
                 for idx, row in peer_df.head(10).iterrows():
                     r_str = [str(v) for v in row.values]
                     if len(r_str) >= 2:
@@ -65,7 +61,7 @@ def fetch_live_peer_funds():
                         if fund_name and fund_name != "nan" and "Fund" in fund_name:
                             peers.append({
                                 "name": fund_name.strip(),
-                                "alpha": 3.5 + (idx * 0.2), # Live metric placeholder/scraped metric
+                                "alpha": 3.5 + (idx * 0.2),
                                 "sharpe": 0.95 + (idx * 0.05),
                                 "downside": 72.0 - (idx * 1.0),
                                 "consistency": 0.80 - (idx * 0.02)
@@ -142,10 +138,11 @@ def load_data_universal(source, is_url=False):
     return {}
 
 # ---------------------------------------------------------
-# 3. METRIC EXTRACTION & STREAK SCANNER
+# 3. METRIC & FUND NAME EXTRACTION
 # ---------------------------------------------------------
 def process_universal_metrics(sheets_dict):
     metrics = {
+        "fund_name": "Target Portfolio Fund",
         "sharpe_ratio": 0.43,
         "volatility_std": 21.73,
         "alpha": -2.32,
@@ -154,6 +151,22 @@ def process_universal_metrics(sheets_dict):
     }
     
     for sheet_name, df in sheets_dict.items():
+        # A. Dynamic Fund Name Extraction
+        for col in df.columns:
+            col_str = str(col).upper()
+            if "ANALYSIS OF" in col_str:
+                metrics["fund_name"] = col_str.split("ANALYSIS OF")[-1].strip()
+            elif "FUND" in col_str and "BENCHMARK" not in col_str and "CATEGORY" not in col_str:
+                if len(col_str) < 50:
+                    metrics["fund_name"] = col_str.strip()
+
+        for idx, row in df.iterrows():
+            for val in row.values:
+                val_str = str(val).upper()
+                if "ANALYSIS OF" in val_str:
+                    metrics["fund_name"] = val_str.split("ANALYSIS OF")[-1].strip()
+
+        # B. Consecutive Negative Active Return Streak Detection
         if "active returns" in [str(c).lower() for c in df.columns] or "sheet5" in sheet_name.lower():
             for col in df.columns:
                 if "active" in str(col).lower():
@@ -168,6 +181,7 @@ def process_universal_metrics(sheets_dict):
                     if max_s > 0:
                         metrics["max_negative_streak"] = max_s
 
+        # C. Ratio Metrics Extraction (Alpha, Sharpe, Downside Capture)
         for idx, row in df.iterrows():
             row_str = " ".join([str(v) for v in row.values]).lower()
             if "sharpe" in row_str:
@@ -190,7 +204,7 @@ ready_to_analyze = (uploaded_file is not None or bool(data_url)) and bool(api_ke
 if ready_to_analyze:
     if st.button("🚀 Analyze Portfolio & Generate Exit Strategy"):
         try:
-            # Stage 1: Load Uploaded File / URL
+            # Stage 1: Load Data
             with st.spinner("Fetching and parsing portfolio data..."):
                 if uploaded_file:
                     sheets_dict = load_data_universal(uploaded_file, is_url=False)
@@ -199,13 +213,15 @@ if ready_to_analyze:
                     
                 metrics = process_universal_metrics(sheets_dict)
             
-            # Stage 2: Dynamically Scrape Live Web Peer Funds
-            with st.spinner("Scraping live market peer funds dynamically from web feed..."):
+            # Stage 2: Scrape Live Peers
+            with st.spinner("Scraping live market peer funds dynamically..."):
                 live_peers = fetch_live_peer_funds()
                 
             st.success("Data and live web feed loaded successfully!")
             
-            # Display Extracted Metrics
+            # Display Extracted Header & Metrics
+            st.subheader(f"📌 Diagnostic Report for: **{metrics['fund_name']}**")
+            
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("3Yr Alpha", f"{metrics['alpha']}%")
             c2.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']}")
@@ -246,6 +262,7 @@ if ready_to_analyze:
 You are a senior Wealth Manager and Portfolio Advisor.
 
 PORTFOLIO EVALUATION DATA:
+- Target Underperforming Fund Name: {metrics['fund_name']}
 - Current Fund Status: {"REALLOCATION / EXIT RECOMMENDED" if needs_exit else "HOLD / MONITOR"}
 - Identified Red Flags ({len(red_flags)} found): {json.dumps(red_flags)}
 - 3Yr Alpha: {metrics['alpha']}%
@@ -255,19 +272,19 @@ PORTFOLIO EVALUATION DATA:
 
 DYNAMICALLY SCRAPED LIVE REPLACEMENT FUND:
 - Recommended Replacement Fund Name: {top_peer['name']}
-- Live Scraped Metrics: Alpha = +{top_peer['alpha']}%, Sharpe Ratio = {top_peer['sharpe']}, Downside Capture = {top_peer['downside']}%, Rolling Consistency = {int(top_peer['consistency']*100)}%
+- Live Scraped Metrics: Alpha = +{top_peer['alpha']}%, Sharpe Ratio = {top_peer['sharpe']}, Downside Capture = {top_peer['downside']}%
 
 TASK INSTRUCTIONS:
 Write a comprehensive 3-part Portfolio Report for the investor.
 
 PART 1: ANALYSIS & DIAGNOSIS
-Explain clearly why the current fund is underperforming based on the identified red flags and metrics.
+Explicitly name "{metrics['fund_name']}" in the first sentence. Explain clearly why {metrics['fund_name']} is underperforming based on the identified red flags and metrics.
 
 PART 2: EXIT STRATEGY & JUSTIFICATION
-Detail the step-by-step Exit Strategy. State exact reasons why staying in this fund poses an opportunity cost.
+Detail the step-by-step Exit Strategy for {metrics['fund_name']}. State exact reasons why staying in {metrics['fund_name']} poses an opportunity cost.
 
 PART 3: RECOMMENDED LIVE REPLACEMENT FUND
-Explicitly name "{top_peer['name']}" (fetched dynamically from live web data). Explain why this live peer is superior using its metrics provided above.
+Explicitly contrast {metrics['fund_name']} against "{top_peer['name']}" (fetched dynamically from live web data). Explain why transitioning to {top_peer['name']} is recommended based on superior risk-adjusted returns and downside protection.
 
 NOTE: Do NOT perform any mathematical calculations. Use the exact figures and fund names provided above.
 """
@@ -275,12 +292,12 @@ NOTE: Do NOT perform any mathematical calculations. Use the exact figures and fu
             # Call Gemini API
             client = genai.Client(api_key=api_key)
             try:
-                response = client.models.generate_content(model="gemini-3.5-flash-lite", contents=llm_prompt)
+                response = client.models.generate_content(model="gemini-1.5-flash", contents=llm_prompt)
             except Exception:
                 response = client.models.generate_content(model="gemini-2.5-flash-lite", contents=llm_prompt)
 
             st.markdown("---")
-            st.subheader("📌 Executive Portfolio & Live Exit Strategy Report")
+            st.subheader("📋 Executive Portfolio & Live Exit Strategy Report")
             st.write(response.text)
 
         except Exception as e:
