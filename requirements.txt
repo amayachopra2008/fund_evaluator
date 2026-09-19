@@ -5,3 +5,4 @@ openpyxl
 pdfplumber
 requests
 google-genai
+beautifulsoup4
