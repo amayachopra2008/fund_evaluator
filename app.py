@@ -292,7 +292,7 @@ NOTE: Do NOT perform any mathematical calculations. Use the exact figures and fu
             # Call Gemini API
             client = genai.Client(api_key=api_key)
             try:
-                response = client.models.generate_content(model="gemini-1.5-flash", contents=llm_prompt)
+                response = client.models.generate_content(model="gemini-3.5-flash-lite", contents=llm_prompt)
             except Exception:
                 response = client.models.generate_content(model="gemini-2.5-flash-lite", contents=llm_prompt)
 
