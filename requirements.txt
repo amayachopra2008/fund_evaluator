@@ -1,8 +1,9 @@
 streamlit
 pandas
 numpy
+google-genai
+requests
+beautifulsoup4
+lxml
 openpyxl
 pdfplumber
-requests
-google-genai
-beautifulsoup4
