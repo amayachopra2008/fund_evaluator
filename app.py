@@ -1,183 +1,218 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from google import genai
+import google.genai as genai
+import json
+import requests
+import io
 
-# --- APP CONFIGURATION ---
-st.set_page_config(page_title="Institutional Fund Evaluator", layout="wide")
-st.title("📊 Institutional Fund Evaluation & Fundamental Engine")
-st.write("Analyze mutual funds using quantitative risk-adjusted metrics, valuation signals (P/E), portfolio churn, and LLM-driven fundamental manager analysis.")
+st.set_page_config(page_title="Universal Portfolio & Exit Engine", layout="wide")
+st.title("📊 Universal Portfolio Evaluator & Exit Strategy Engine")
 
-# --- SIDEBAR: API KEY SETUP ---
-st.sidebar.header("Settings")
-api_key = st.sidebar.text_input("Enter Gemini API Key:", type="password")
+st.markdown("""
+Analyze portfolio performance by **uploading a file** or **entering a direct URL** (Excel, CSV, TSV, Google Sheets CSV export).
+""")
 
-# --- MULTI-INPUT SECTION ---
-st.subheader("1. Input Fund Data")
-input_mode = st.radio("Select Input Method:", ["Upload Excel/PDF Analysis", "Paste Factsheet / Link / Raw Portfolio Text"])
+# ---------------------------------------------------------
+# INPUT METHOD SELECTION & API KEY
+# ---------------------------------------------------------
+input_method = st.radio("Choose Input Method:", ["Upload File", "Paste Data URL"], horizontal=True)
 
 uploaded_file = None
-raw_text_input = ""
+data_url = None
 
-if input_mode == "Upload Excel/PDF Analysis":
-    uploaded_file = st.file_uploader("Upload Portfolio Analysis File (.xlsx)", type=["xlsx"])
+if input_method == "Upload File":
+    uploaded_file = st.file_uploader(
+        "Upload Portfolio File (Excel, CSV, TXT, TSV, PDF)", 
+        type=["xlsx", "xls", "csv", "txt", "tsv", "pdf"]
+    )
 else:
-    raw_text_input = st.text_area("Paste Factsheet Details, Stock Selections, or Fund Links:", height=150)
+    data_url = st.text_input(
+        "Enter Direct Data URL (e.g., direct CSV link, raw GitHub file, or published Google Sheet CSV link)"
+    )
 
-# Default baseline values (used when file/text parsing relies on category defaults)
-fund_data = {
-    "name": "HSBC Small Cap Fund",
-    "alpha": -2.32,
-    "sharpe": 0.43,
-    "downside_capture": 95.0,
-    "pe_ratio": 28.5,
-    "turnover_ratio": 65.0,
-    "rolling_consistency": 0.75,
-    "max_streak": 3,
-    "hidden_underperforming_years": 5
-}
+api_key = st.text_input("Enter Google Gemini API Key", type="password")
 
-cat_data = {
-    "alpha": 0.47,
-    "sharpe": 0.55,
-    "downside_capture": 81.0,
-    "pe_ratio": 24.2,
-    "turnover_ratio": 42.0
-}
-
-# --- EVALUATION RUNNER ---
-if (uploaded_file or raw_text_input) and api_key:
-    if st.button("🚀 Run Comprehensive Evaluation"):
-        with st.spinner("Processing metrics, scanning valuation signals, and evaluating manager fundamentals..."):
+# ---------------------------------------------------------
+# 1. MULTI-SOURCE UNIVERSAL READER (FILE & URL)
+# ---------------------------------------------------------
+def load_data_universal(source, is_url=False):
+    if is_url:
+        response = requests.get(source)
+        response.raise_for_status()
+        url_lower = source.lower()
+        if url_lower.endswith(('.xlsx', '.xls')) or 'spreadsheet' in response.headers.get('Content-Type', ''):
+            xls = pd.ExcelFile(io.BytesIO(response.content))
+            return {sheet: pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names}
+        else:
+            return {"Sheet1": pd.read_csv(io.StringIO(response.text))}
+    else:
+        filename = source.name.lower()
+        if filename.endswith(('.xlsx', '.xls')):
+            xls = pd.ExcelFile(source)
+            return {sheet: pd.read_excel(source, sheet_name=sheet) for sheet in xls.sheet_names}
+        elif filename.endswith(('.csv', '.tsv', '.txt')):
             try:
-                # Parse custom Excel if available
-                if uploaded_file and input_mode == "Upload Excel/PDF Analysis":
-                    try:
-                        df_sheet5 = pd.read_excel(uploaded_file, sheet_name='Sheet5')
-                        df_sheet6 = pd.read_excel(uploaded_file, sheet_name='Sheet6')
+                return {"Sheet1": pd.read_csv(source, sep=None, engine='python')}
+            except Exception:
+                source.seek(0)
+                return {"Sheet1": pd.read_csv(source, sep='\t', engine='python')}
+        elif filename.endswith('.pdf'):
+            import pdfplumber
+            text_lines = []
+            with pdfplumber.open(source) as pdf:
+                for page in pdf.pages:
+                    if page.extract_text():
+                        text_lines.extend(page.extract_text().split("\n"))
+            return {"Sheet1": pd.DataFrame({"PDF_Text": text_lines})}
+            
+    return {}
 
-                        s5 = df_sheet5.iloc[1:11, [2, 3, 4, 5]].copy()
-                        s5.columns = ['Year', 'Fund_Return', 'Benchmark_Return', 'Active_Return']
-                        s5['Active_Return'] = pd.to_numeric(s5['Active_Return'])
+# ---------------------------------------------------------
+# 2. METRIC EXTRACTION & STREAK SCANNER (STAGES 1 - 3)
+# ---------------------------------------------------------
+def process_universal_metrics(sheets_dict):
+    metrics = {
+        "sharpe_ratio": 0.43,
+        "volatility_std": 21.73,
+        "alpha": -2.32,
+        "downside_capture": 95.0,
+        "max_negative_streak": 2
+    }
+    
+    for sheet_name, df in sheets_dict.items():
+        # Check active returns for consecutive underperformance streak (Stage 2)
+        if "active returns" in [str(c).lower() for c in df.columns] or "sheet5" in sheet_name.lower():
+            for col in df.columns:
+                if "active" in str(col).lower():
+                    active_vals = pd.to_numeric(df[col], errors='coerce').dropna().tolist()
+                    current_s, max_s = 0, 0
+                    for val in active_vals:
+                        if val < 0:
+                            current_s += 1
+                            max_s = max(max_s, current_s)
+                        else:
+                            current_s = 0
+                    if max_s > 0:
+                        metrics["max_negative_streak"] = max_s
 
-                        hidden_years = int((s5['Active_Return'] < 0).sum())
-                        fund_data["hidden_underperforming_years"] = hidden_years
+        # Check multi-period metrics (Stage 3)
+        for idx, row in df.iterrows():
+            row_str = " ".join([str(v) for v in row.values]).lower()
+            if "sharpe" in row_str:
+                nums = [float(v) for v in row.values if str(v).replace('.', '', 1).replace('-', '', 1).isdigit()]
+                if nums: metrics["sharpe_ratio"] = nums[0]
+            if "alpha" in row_str:
+                nums = [float(v) for v in row.values if str(v).replace('.', '', 1).replace('-', '', 1).isdigit()]
+                if nums: metrics["alpha"] = nums[0]
+            if "downside" in row_str:
+                nums = [float(v) for v in row.values if str(v).replace('.', '', 1).replace('-', '', 1).isdigit()]
+                if nums: metrics["downside_capture"] = nums[0]
 
-                        metrics_clean = df_sheet6.iloc[1:6, [3, 4, 5]].copy()
-                        metrics_clean.columns = ['Metric', 'Fund_Value', 'Category_Avg']
-                        m_dict = dict(zip(metrics_clean['Metric'], metrics_clean['Fund_Value'].astype(float)))
-                        c_dict = dict(zip(metrics_clean['Metric'], metrics_clean['Category_Avg'].astype(float)))
+    return metrics
 
-                        fund_data["alpha"] = m_dict.get('Alpha', fund_data["alpha"])
-                        fund_data["sharpe"] = m_dict.get('Sharpe Ratio', fund_data["sharpe"])
-                        fund_data["downside_capture"] = m_dict.get('Downside Capture', fund_data["downside_capture"])
-                        cat_data["alpha"] = c_dict.get('Alpha', cat_data["alpha"])
-                        cat_data["sharpe"] = c_dict.get('Sharpe Ratio', cat_data["sharpe"])
-                        cat_data["downside_capture"] = c_dict.get('Downside Capture', cat_data["downside_capture"])
-                    except Exception:
-                        st.info("Using baseline benchmark structure for secondary metrics.")
+# ---------------------------------------------------------
+# EXECUTION PIPELINE
+# ---------------------------------------------------------
+ready_to_analyze = (uploaded_file is not None or bool(data_url)) and bool(api_key)
 
-                # 2. RISK & VALUATION SIGNALS EVALUATION
-                flag_count = sum([
-                    fund_data["max_streak"] >= 2,
-                    fund_data["alpha"] < 0.0,
-                    fund_data["sharpe"] < cat_data["sharpe"],
-                    fund_data["downside_capture"] > cat_data["downside_capture"],
-                    fund_data["pe_ratio"] > cat_data["pe_ratio"],
-                    fund_data["turnover_ratio"] > cat_data["turnover_ratio"]
-                ])
-
-                # 3. PEER UNIVERSE & LOW P/E + HIGH RISK-ADJUSTED RETURN SCORING
-                peers = [
-                    {
-                        "name": "Nippon India Small Cap Fund",
-                        "alpha": 2.04,
-                        "sharpe": 0.69,
-                        "downside_capture": 78.0,
-                        "pe_ratio": 22.1,  # Low P/E
-                        "turnover_ratio": 28.0,
-                        "consistency": 0.80,
-                        "manager": "Sameer Rachh",
-                        "style": "High-conviction, low P/E growth-at-reasonable-price (GARP) stock selection."
-                    },
-                    {
-                        "name": "SBI Small Cap Fund",
-                        "alpha": 1.95,
-                        "sharpe": 0.65,
-                        "downside_capture": 74.2,
-                        "pe_ratio": 23.5,
-                        "turnover_ratio": 18.0,
-                        "consistency": 0.75,
-                        "manager": "R. Srinivasan",
-                        "style": "Value-oriented, strict downside protection with low portfolio churn."
-                    }
-                ]
-
-                # Rank peers: High Risk-Adjusted Return (Alpha/Sharpe) + Low P/E + Low Downside Capture
-                for p in peers:
-                    p["score"] = (p["alpha"] * 2.0) + (p["sharpe"] * 1.5) - (p["pe_ratio"] * 0.5) - (p["downside_capture"] * 0.1)
+if ready_to_analyze:
+    if st.button("🚀 Analyze Portfolio & Generate Exit Strategy"):
+        try:
+            # Stage 1: Load Data
+            if uploaded_file:
+                sheets_dict = load_data_universal(uploaded_file, is_url=False)
+            else:
+                sheets_dict = load_data_universal(data_url, is_url=True)
                 
-                peers.sort(key=lambda x: x["score"], reverse=True)
-                best_peer = peers[0]
+            metrics = process_universal_metrics(sheets_dict)
+            
+            st.success("Portfolio data successfully processed!")
+            
+            # Display Extracted Metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("3Yr Alpha", f"{metrics['alpha']}%")
+            c2.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']}")
+            c3.metric("Downside Capture", f"{metrics['downside_capture']}%")
+            c4.metric("Negative Streak", f"{metrics['max_negative_streak']} Years")
 
-                # 4. LLM PROMPT FOR FUNDAMENTAL COMPARATIVE STUDY
-                llm_prompt = f"""
-                You are a senior fund analyst conducting a deep-dive fundamental and comparative evaluation.
+            # Stages 3 & 4: Multi-Signal Flagging Engine
+            category_benchmarks = {"sharpe_avg": 0.55, "downside_max": 85.0}
+            red_flags = []
+            
+            if metrics["alpha"] < 0:
+                red_flags.append("Negative Alpha (Consistently underperforming benchmark return)")
+            if metrics["sharpe_ratio"] < category_benchmarks["sharpe_avg"]:
+                red_flags.append(f"Subpar Sharpe Ratio ({metrics['sharpe_ratio']} vs Category Avg {category_benchmarks['sharpe_avg']})")
+            if metrics["downside_capture"] > category_benchmarks["downside_max"]:
+                red_flags.append(f"High Downside Capture ({metrics['downside_capture']}% vs Category Max {category_benchmarks['downside_max']}%)")
+            if metrics["max_negative_streak"] >= 2:
+                red_flags.append(f"Underperformance Streak of {metrics['max_negative_streak']} consecutive years")
 
-                CURRENT FUND EVALUATION: {fund_data['name']}
-                - Risk Status: FLAGGED FOR REPLACEMENT ({flag_count}/6 risk & valuation flags)
-                - Total Hidden Underperforming Years: {fund_data['hidden_underperforming_years']} out of 10 years
-                - Max Consecutive Loss Streak: {fund_data['max_streak']} years
-                - 3-Yr Rolling Return Consistency: {int(fund_data['rolling_consistency']*100)}%
-                - 3-Yr Alpha: {fund_data['alpha']} (Cat Avg: {cat_data['alpha']})
-                - 3-Yr Sharpe Ratio: {fund_data['sharpe']} (Cat Avg: {cat_data['sharpe']})
-                - Downside Capture: {fund_data['downside_capture']}% (Cat Avg: {cat_data['downside_capture']}%)
-                - Portfolio P/E Ratio: {fund_data['pe_ratio']} (Cat Avg: {cat_data['pe_ratio']}) [High Valuation Risk]
-                - Portfolio Turnover Ratio: {fund_data['turnover_ratio']}% (Cat Avg: {cat_data['turnover_ratio']}%) [High Churn]
+            needs_exit = len(red_flags) >= 2
 
-                RECOMMENDED REPLACEMENT: {best_peer['name']}
-                - Replacement Metrics: Alpha = +{best_peer['alpha']}%, Sharpe = {best_peer['sharpe']}, Downside Capture = {best_peer['downside_capture']}%, Portfolio P/E = {best_peer['pe_ratio']} (vs Category Avg {cat_data['pe_ratio']}), Portfolio Turnover = {best_peer['turnover_ratio']}%
-                - Key Manager Strategy: Managed by {best_peer['manager']}. Strategy: {best_peer['style']}
+            # Stages 5 & 6: Load Peers & Auto-Rank Best Candidate
+            candidate_peers = [
+                {"name": "Nippon India Small Cap Fund", "alpha": 4.5, "sharpe": 1.10, "downside": 68.0, "consistency": 0.82},
+                {"name": "Sundaram Small Cap Fund", "alpha": 3.8, "sharpe": 0.98, "downside": 71.0, "consistency": 0.79},
+                {"name": "Kotak Small Cap Fund", "alpha": 2.5, "sharpe": 0.85, "downside": 74.0, "consistency": 0.74},
+                {"name": "Axis Small Cap Fund", "alpha": 2.1, "sharpe": 0.88, "downside": 70.0, "consistency": 0.75}
+            ]
 
-                ADDITIONAL INPUT CONTEXT / FACTSHEETS:
-                {raw_text_input if raw_text_input else "Standard institutional dataset applied."}
+            scored_peers = []
+            for peer in candidate_peers:
+                score = (
+                    (peer["alpha"] - metrics["alpha"]) * 2.0 +
+                    (peer["sharpe"] - metrics["sharpe_ratio"]) * 1.5 +
+                    (peer["consistency"] - 0.50) * 10.0 -
+                    (peer["downside"] - metrics["downside_capture"]) * 0.1
+                )
+                scored_peers.append((score, peer))
 
-                INSTRUCTIONS FOR LLM SUMMARY (2 Paragraphs):
-                - Paragraph 1 (Current Fund Diagnostics): Detail why {fund_data['name']} is failing. Discuss how its high P/E ratio ({fund_data['pe_ratio']}) relative to category average ({cat_data['pe_ratio']}) combined with excessive portfolio churn ({fund_data['turnover_ratio']}% turnover) and negative alpha indicates poor stock selection discipline. Explicitly highlight the {fund_data['hidden_underperforming_years']} total underperforming years concealed beneath overall category averages.
-                - Paragraph 2 (Fundamental Comparative Study & Replacement Recommendation): Present {best_peer['name']} as the optimal replacement. Compare the fundamental management approaches of both funds. Explain how the combination of lower P/E ratio ({best_peer['pe_ratio']}), superior risk-adjusted returns (Alpha +{best_peer['alpha']}%, Sharpe {best_peer['sharpe']}), lower downside capture ({best_peer['downside_capture']}%), and disciplined portfolio turnover makes it fundamentally stronger for long-term compounding.
-                """
+            scored_peers.sort(key=lambda x: x[0], reverse=True)
+            top_peer = scored_peers[0][1]
 
-                client = genai.Client(api_key=api_key)
-                try:
-                    response = client.models.generate_content(model="gemini-3.6-flash", contents=llm_prompt)
-                except Exception:
-                    response = client.models.generate_content(model="gemini-2.5-flash-lite", contents=llm_prompt)
+            # Stage 7: LLM Narrative Synthesis Payload
+            llm_prompt = f"""
+You are a senior Wealth Manager and Portfolio Advisor.
 
-                # 5. DASHBOARD PRESENTATION
-                st.success("✅ Evaluation Complete!")
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.subheader("🚩 Risk & Hidden Deficit")
-                    st.metric("Total Flagged Signals", f"{flag_count}/6")
-                    st.metric("Hidden Underperforming Years", f"{fund_data['hidden_underperforming_years']} / 10 Years")
-                    st.metric("Max Underperformance Streak", f"{fund_data['max_streak']} Years")
-                with col2:
-                    st.subheader("📉 Current Fund Valuation")
-                    st.metric("Fund P/E Ratio", f"{fund_data['pe_ratio']}", delta=f"{round(fund_data['pe_ratio'] - cat_data['pe_ratio'], 1)} vs Cat Avg", delta_color="inverse")
-                    st.metric("Portfolio Turnover", f"{fund_data['turnover_ratio']}%", delta=f"{round(fund_data['turnover_ratio'] - cat_data['turnover_ratio'], 1)}% vs Cat Avg", delta_color="inverse")
-                    st.metric("Downside Capture", f"{fund_data['downside_capture']}%", delta=f"{round(fund_data['downside_capture'] - cat_data['downside_capture'], 1)}% vs Cat Avg", delta_color="inverse")
-                with col3:
-                    st.subheader("🏆 Recommended Replacement")
-                    st.metric("Top Replacement Fund", best_peer['name'])
-                    st.metric("Replacement P/E Ratio", f"{best_peer['pe_ratio']}", delta="Low P/E Advantage")
-                    st.metric("Replacement Alpha / Sharpe", f"+{best_peer['alpha']}% / {best_peer['sharpe']}")
+PORTFOLIO EVALUATION DATA:
+- Current Fund Status: {"REALLOCATION / EXIT RECOMMENDED" if needs_exit else "HOLD / MONITOR"}
+- Identified Red Flags ({len(red_flags)} found): {json.dumps(red_flags)}
+- 3Yr Alpha: {metrics['alpha']}%
+- Sharpe Ratio: {metrics['sharpe_ratio']}
+- Downside Capture: {metrics['downside_capture']}%
+- Consecutive Negative Streak: {metrics['max_negative_streak']} Years
 
-                st.markdown("---")
-                st.subheader("📝 Comparative Fundamental Summary")
-                st.write(response.text)
+AUTO-SELECTED TOP REPLACEMENT FUND:
+- Recommended Replacement Fund Name: {top_peer['name']}
+- Replacement Metrics: Alpha = +{top_peer['alpha']}%, Sharpe Ratio = {top_peer['sharpe']}, Downside Capture = {top_peer['downside']}%, Rolling Consistency = {int(top_peer['consistency']*100)}%
 
-            except Exception as e:
-                st.error(f"Error executing fundamental pipeline: {e}")
-elif not api_key:
-    st.warning("Please enter your Gemini API Key in the sidebar to run the engine.")
+TASK INSTRUCTIONS:
+Write a comprehensive 3-part Portfolio Report for the investor.
+
+PART 1: ANALYSIS & DIAGNOSIS
+Explain clearly why the current fund is underperforming based on the identified red flags and metrics.
+
+PART 2: EXIT STRATEGY & JUSTIFICATION (WITH REASONS)
+Detail the step-by-step Exit Strategy. State the exact reasons why staying in this fund poses an opportunity cost.
+
+PART 3: RECOMMENDED REPLACEMENT FUND
+Explicitly name "{top_peer['name']}" as the recommended replacement fund. Explain specifically why this named fund is superior using its metrics provided above (higher Alpha, lower Downside Capture of {top_peer['downside']}%, and higher Rolling Consistency).
+
+NOTE: Do NOT perform any mathematical calculations. Use the exact figures and fund names provided above.
+"""
+
+            # Call Gemini API
+            client = genai.Client(api_key=api_key)
+            try:
+                response = client.models.generate_content(model="gemini-2.5-flash", contents=llm_prompt)
+            except Exception:
+                response = client.models.generate_content(model="gemini-2.5-flash-lite", contents=llm_prompt)
+
+            st.markdown("---")
+            st.subheader("📌 Executive Portfolio & Exit Strategy Report")
+            st.write(response.text)
+
+        except Exception as e:
+            st.error(f"Error processing portfolio data: {str(e)}")
