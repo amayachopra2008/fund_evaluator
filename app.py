@@ -5,16 +5,18 @@ import google.genai as genai
 import json
 import requests
 import io
+from bs4 import BeautifulSoup
 
+# --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Universal Portfolio & Exit Engine", layout="wide")
 st.title("📊 Universal Portfolio Evaluator & Exit Strategy Engine")
 
 st.markdown("""
-Analyze portfolio performance by **uploading a file** or **entering a direct URL** (Excel, CSV, TSV, Google Sheets CSV export).
+Analyze portfolio performance by **uploading a file** or **entering a direct URL** (Excel, CSV, TSV, Google Sheets CSV, or Morningstar/ValueResearch web page link).
 """)
 
 # ---------------------------------------------------------
-# INPUT METHOD SELECTION & API KEY
+# INPUT METHOD SELECTION & CONFIGURATION
 # ---------------------------------------------------------
 input_method = st.radio("Choose Input Method:", ["Upload File", "Paste Data URL"], horizontal=True)
 
@@ -28,35 +30,65 @@ if input_method == "Upload File":
     )
 else:
     data_url = st.text_input(
-        "Enter Direct Data URL (e.g., direct CSV link, raw GitHub file, or published Google Sheet CSV link)"
+        "Enter Direct Data URL (e.g., direct CSV/Excel link, raw GitHub file, Morningstar performance page)"
     )
 
 api_key = st.text_input("Enter Google Gemini API Key", type="password")
 
 # ---------------------------------------------------------
-# 1. MULTI-SOURCE UNIVERSAL READER (FILE & URL)
+# 1. UNIVERSAL DATA READER (FILES, RAW URLS & WEBPAGES)
 # ---------------------------------------------------------
 def load_data_universal(source, is_url=False):
     if is_url:
-        response = requests.get(source)
+        # Browser User-Agent header to avoid anti-bot blocks from financial sites
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        }
+        response = requests.get(source, headers=headers)
         response.raise_for_status()
+        
+        content_type = response.headers.get('Content-Type', '').lower()
         url_lower = source.lower()
-        if url_lower.endswith(('.xlsx', '.xls')) or 'spreadsheet' in response.headers.get('Content-Type', ''):
+        
+        # A. Handle Direct Excel URLs
+        if url_lower.endswith(('.xlsx', '.xls')) or 'spreadsheet' in content_type:
             xls = pd.ExcelFile(io.BytesIO(response.content))
             return {sheet: pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names}
+            
+        # B. Handle HTML Webpages (e.g., Morningstar, ValueResearch links)
+        elif 'html' in content_type or url_lower.endswith(('.aspx', '.html', '.htm')) or not url_lower.endswith(('.csv', '.tsv', '.txt')):
+            try:
+                # Scrape and extract all tabular data found on the web page
+                tables = pd.read_html(io.StringIO(response.text))
+                if tables:
+                    return {f"Table_{i+1}": df for i, df in enumerate(tables)}
+            except Exception:
+                pass
+            
+            # Fallback text extraction if no structured <table> tags are found
+            soup = BeautifulSoup(response.text, 'html.parser')
+            text_data = soup.get_text(separator='\n')
+            return {"Sheet1": pd.DataFrame({"Web_Text": text_data.splitlines()})}
+
+        # C. Handle Direct Raw CSV / TSV URLs
         else:
-            return {"Sheet1": pd.read_csv(io.StringIO(response.text))}
+            try:
+                return {"Sheet1": pd.read_csv(io.StringIO(response.text), on_bad_lines='skip')}
+            except Exception:
+                return {"Sheet1": pd.read_csv(io.StringIO(response.text), sep='\t', on_bad_lines='skip')}
+                
     else:
+        # File Upload Parsing Engine
         filename = source.name.lower()
         if filename.endswith(('.xlsx', '.xls')):
             xls = pd.ExcelFile(source)
             return {sheet: pd.read_excel(source, sheet_name=sheet) for sheet in xls.sheet_names}
         elif filename.endswith(('.csv', '.tsv', '.txt')):
             try:
-                return {"Sheet1": pd.read_csv(source, sep=None, engine='python')}
+                return {"Sheet1": pd.read_csv(source, sep=None, engine='python', on_bad_lines='skip')}
             except Exception:
                 source.seek(0)
-                return {"Sheet1": pd.read_csv(source, sep='\t', engine='python')}
+                return {"Sheet1": pd.read_csv(source, sep='\t', engine='python', on_bad_lines='skip')}
         elif filename.endswith('.pdf'):
             import pdfplumber
             text_lines = []
@@ -69,7 +101,7 @@ def load_data_universal(source, is_url=False):
     return {}
 
 # ---------------------------------------------------------
-# 2. METRIC EXTRACTION & STREAK SCANNER (STAGES 1 - 3)
+# 2. METRIC EXTRACTION & STREAK SCANNER
 # ---------------------------------------------------------
 def process_universal_metrics(sheets_dict):
     metrics = {
@@ -81,7 +113,7 @@ def process_universal_metrics(sheets_dict):
     }
     
     for sheet_name, df in sheets_dict.items():
-        # Check active returns for consecutive underperformance streak (Stage 2)
+        # Scan Active Returns column for consecutive negative streaks
         if "active returns" in [str(c).lower() for c in df.columns] or "sheet5" in sheet_name.lower():
             for col in df.columns:
                 if "active" in str(col).lower():
@@ -96,7 +128,7 @@ def process_universal_metrics(sheets_dict):
                     if max_s > 0:
                         metrics["max_negative_streak"] = max_s
 
-        # Check multi-period metrics (Stage 3)
+        # Scan for multi-period ratio metrics across sheets/tables
         for idx, row in df.iterrows():
             row_str = " ".join([str(v) for v in row.values]).lower()
             if "sharpe" in row_str:
@@ -112,7 +144,7 @@ def process_universal_metrics(sheets_dict):
     return metrics
 
 # ---------------------------------------------------------
-# EXECUTION PIPELINE
+# 3. PIPELINE EXECUTION
 # ---------------------------------------------------------
 ready_to_analyze = (uploaded_file is not None or bool(data_url)) and bool(api_key)
 
@@ -120,23 +152,24 @@ if ready_to_analyze:
     if st.button("🚀 Analyze Portfolio & Generate Exit Strategy"):
         try:
             # Stage 1: Load Data
-            if uploaded_file:
-                sheets_dict = load_data_universal(uploaded_file, is_url=False)
-            else:
-                sheets_dict = load_data_universal(data_url, is_url=True)
-                
-            metrics = process_universal_metrics(sheets_dict)
+            with st.spinner("Fetching and parsing portfolio data..."):
+                if uploaded_file:
+                    sheets_dict = load_data_universal(uploaded_file, is_url=False)
+                else:
+                    sheets_dict = load_data_universal(data_url, is_url=True)
+                    
+                metrics = process_universal_metrics(sheets_dict)
             
-            st.success("Portfolio data successfully processed!")
+            st.success("Data successfully loaded!")
             
-            # Display Extracted Metrics
+            # Display Extracted Metrics Overview
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("3Yr Alpha", f"{metrics['alpha']}%")
             c2.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']}")
             c3.metric("Downside Capture", f"{metrics['downside_capture']}%")
             c4.metric("Negative Streak", f"{metrics['max_negative_streak']} Years")
 
-            # Stages 3 & 4: Multi-Signal Flagging Engine
+            # Stages 3 & 4: Multi-Signal Decision Engine
             category_benchmarks = {"sharpe_avg": 0.55, "downside_max": 85.0}
             red_flags = []
             
@@ -151,7 +184,7 @@ if ready_to_analyze:
 
             needs_exit = len(red_flags) >= 2
 
-            # Stages 5 & 6: Load Peers & Auto-Rank Best Candidate
+            # Stages 5 & 6: Load Peers & Auto-Rank Best Replacement
             candidate_peers = [
                 {"name": "Nippon India Small Cap Fund", "alpha": 4.5, "sharpe": 1.10, "downside": 68.0, "consistency": 0.82},
                 {"name": "Sundaram Small Cap Fund", "alpha": 3.8, "sharpe": 0.98, "downside": 71.0, "consistency": 0.79},
@@ -172,7 +205,7 @@ if ready_to_analyze:
             scored_peers.sort(key=lambda x: x[0], reverse=True)
             top_peer = scored_peers[0][1]
 
-            # Stage 7: LLM Narrative Synthesis Payload
+            # Stage 7: Gemini Prompt Payload Construction
             llm_prompt = f"""
 You are a senior Wealth Manager and Portfolio Advisor.
 
@@ -203,7 +236,7 @@ Explicitly name "{top_peer['name']}" as the recommended replacement fund. Explai
 NOTE: Do NOT perform any mathematical calculations. Use the exact figures and fund names provided above.
 """
 
-            # Call Gemini API
+            # Call Gemini API using gemini-1.5-flash / gemini-2.5-flash-lite
             client = genai.Client(api_key=api_key)
             try:
                 response = client.models.generate_content(model="gemini-3.5-flash-lite", contents=llm_prompt)
@@ -216,3 +249,5 @@ NOTE: Do NOT perform any mathematical calculations. Use the exact figures and fu
 
         except Exception as e:
             st.error(f"Error processing portfolio data: {str(e)}")
+elif (uploaded_file or data_url) and not api_key:
+    st.warning("Please enter your Gemini API Key above to run the automated summary.")
