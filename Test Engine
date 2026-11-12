@@ -1,0 +1,126 @@
+"""Offline checks for engine.py (no network, no yfinance needed). Run: python test_engine.py"""
+import io
+
+import numpy as np
+import pandas as pd
+
+import engine as eng
+
+# ---- number parsing
+assert eng._to_num("12.5%") == 12.5 and eng._to_num("1,234") == 1234 and eng._to_num("(5.2)") == -5.2
+assert np.isnan(eng._to_num("n/a"))
+
+# ---- holdings: Excel-style sheet, header buried below a title row, with a Total row
+raw = pd.DataFrame([
+    ["My Portfolio", None, None],
+    [None, None, None],
+    ["Stock", "Sector", "Weight %"],
+    ["Reliance Industries", "Energy", "9.5%"],
+    ["HDFC Bank", "Financials", 7.0],
+    ["Total", None, 100],
+])
+h, note = eng.extract_holdings({"Sheet1": raw}, [])
+assert list(h["input_name"]) == ["Reliance Industries", "HDFC Bank"], h
+assert list(h["weight_pct"]) == [9.5, 7.0], h
+
+# ---- holdings: value column converted to %
+raw2 = pd.DataFrame({"Symbol": ["TCS", "INFY"], "Market Value": ["3,00,000", "1,00,000"]})
+h2, _ = eng.extract_holdings({"s": raw2}, [])
+assert round(h2["weight_pct"].sum()) == 100 and round(h2["weight_pct"].iloc[0]) == 75, h2
+
+# ---- holdings: qty x price
+raw3 = pd.DataFrame({"Company": ["A Ltd", "B Ltd"], "Qty": [10, 10], "LTP": [100, 300]})
+h3, _ = eng.extract_holdings({"s": raw3}, [])
+assert round(h3["weight_pct"].iloc[1]) == 75, h3
+
+# ---- holdings: free text (PDF-like lines)
+h4, n4 = eng.extract_holdings({}, ["Top holdings", "1. ICICI Bank 8.2%", "2. Infosys Ltd - 6.1 %", "Total 100%"])
+assert list(h4["input_name"]) == ["ICICI Bank", "Infosys Ltd"] and list(h4["weight_pct"]) == [8.2, 6.1], h4
+
+# ---- holdings: ticker-only fallback
+h5, n5 = eng.extract_holdings({}, ["Buy list: TATAMOTORS.NS and ITC, also NIFTY and TOTAL"])
+assert list(h5["input_name"]) == ["TATAMOTORS.NS", "ITC"], h5
+
+# ---- pasted comma text
+sheets, lines = eng.load_sources(text="Stock,Weight\nTCS,10\nINFY,5")
+h6, _ = eng.extract_holdings(sheets, lines)
+assert list(h6["input_name"]) == ["TCS", "INFY"] and list(h6["weight_pct"]) == [10, 5], h6
+
+# ---- Word document with a table
+import docx
+d = docx.Document()
+t = d.add_table(rows=3, cols=2)
+for i, row in enumerate([("Stock", "Weight %"), ("Wipro", "4"), ("Cipla", "6")]):
+    for j, v in enumerate(row):
+        t.cell(i, j).text = v
+buf = io.BytesIO(); d.save(buf); buf.seek(0); buf.name = "p.docx"
+sh, ln = eng.load_sources(uploaded=buf)
+h7, _ = eng.extract_holdings(sh, ln)
+assert list(h7["input_name"]) == ["Wipro", "Cipla"] and list(h7["weight_pct"]) == [4, 6], h7
+
+# ---- Excel file round trip
+xb = io.BytesIO()
+pd.DataFrame({"Ticker": ["SBIN", "ONGC"], "Weight": [5, 6]}).to_excel(xb, index=False); xb.seek(0); xb.name = "p.xlsx"
+sh, ln = eng.load_sources(uploaded=xb)
+h8, _ = eng.extract_holdings(sh, ln)
+assert list(h8["input_name"]) == ["SBIN", "ONGC"], h8
+
+# ---- URL safety guard
+assert not eng._is_safe_url("http://127.0.0.1/x") and not eng._is_safe_url("file:///etc/passwd")
+
+# ---- risk metrics on synthetic prices (bench rises, stock bleeds)
+rng = np.random.default_rng(0)
+idx = pd.bdate_range("2020-11-01", "2026-11-10")
+bench = pd.Series(100 * np.cumprod(1 + rng.normal(0.0005, 0.008, len(idx))), index=idx)
+bad = pd.Series(100 * np.cumprod(1 + rng.normal(-0.0006, 0.018, len(idx))), index=idx)
+good = pd.Series(100 * np.cumprod(1 + 0.0004 + 1.1 * bench.pct_change().fillna(0) + rng.normal(0, 0.003, len(idx))),
+                 index=idx)
+mb, mg = eng.compute_risk_metrics(bad, bench), eng.compute_risk_metrics(good, bench)
+assert mb["alpha"] < mg["alpha"] and mb["sharpe"] < mg["sharpe"], (mb, mg)
+assert mb["current_drawdown"] < 0 and mb["neg_year_streak"] >= 1, mb
+flags_b, status_b = eng.exit_assessment(mb)
+flags_g, status_g = eng.exit_assessment(mg)
+assert status_b in ("EXIT REVIEW", "EXIT RECOMMENDED"), (status_b, flags_b)
+assert len(flags_g) < len(flags_b)
+assert eng.compute_risk_metrics(bad.iloc[:100], bench) is None
+assert eng.streak_counts([1, -1, -1, 1, -1, -1, -1]) == (3, 3) and eng.streak_counts([-1, 1]) == (1, 0)
+
+# ---- valuation verdicts
+v = eng.valuation_verdict
+assert v(12, 20, 0.8)["verdict"] == "Undervalued"
+assert v(30, 20, 2.6)["verdict"] == "Overvalued"
+assert v(20, 20.5, 1.4)["verdict"] == "Fairly priced"
+assert v(12, 20, 2.5)["verdict"] == "Fairly priced"          # conflicting signals
+assert v(-3, 20, None)["verdict"].startswith("Not meaningful")
+assert v(15, None, None)["verdict"] == "Insufficient data"
+assert v(25, 20, None)["verdict"] == "Overvalued"             # PE alone, 25% above avg
+
+# ---- concentration
+port = pd.DataFrame({
+    "symbol": ["A", "B", "C", "D", "E"], "name": ["A", "B", "C", "D", "E"],
+    "sector": ["Fin", "Fin", "IT", "IT", "Energy"], "weight_pct": [10, 7, 6, 5, 72]})
+sec, al = eng.concentration_report(port)
+lv = sorted((a["level"], a["item"]) for a in al)
+assert ("sector", "Fin") in lv and ("sector", "Energy") in lv and ("sector", "IT") not in lv, lv
+assert ("stock", "A") in lv and ("stock", "E") in lv and ("stock", "B") not in lv, lv
+
+# ---- replacement ranking
+def mk(sym, alpha, sharpe, dd, val, flags=0, sector="IT", ind="Software"):
+    return dict(symbol=sym, name=sym, sector=sector, industry=ind, alpha=alpha, sharpe=sharpe,
+                downside_capture=80, current_drawdown=dd, valuation=val, flags=["x"] * flags, error=None)
+tgt = mk("T", -3, 0.2, -30, "Overvalued", 3)
+cands = [mk("good", 5, 1.2, -5, "Undervalued"), mk("ok", 2, 0.8, -10, "Fairly priced"),
+         mk("pricey", 6, 1.3, -4, "Overvalued"), mk("broken", 9, 2, -1, "Undervalued", flags=2),
+         mk("othersector", 9, 2, -1, "Undervalued", sector="Fin"), {"symbol": "err", "error": "x"}]
+rk = [r["symbol"] for r in eng.rank_replacements(tgt, cands)]
+assert rk[0] == "good" and "broken" not in rk and "othersector" not in rk and "err" not in rk, rk
+
+# ---- fallback summary works without an API key
+stock = dict(name="T Ltd", symbol="T.NS", status="EXIT REVIEW", flags=["a", "b"], valuation="Overvalued",
+             pe=30, avg_pe_5y=20, peg=2.5, sector="IT", alpha=-3, sharpe=0.2, downside_capture=90,
+             current_drawdown=-30, neg_year_streak=2, avg_pe_points=4, weight_pct=5)
+s = eng.investor_summary(stock, [dict(name="Good", symbol="G.NS", alpha=5, sharpe=1.2, downside_capture=70,
+                                      current_drawdown=-5, pe=15, avg_pe_5y=20, peg=0.9, valuation="Undervalued")])
+assert "Good" in s and "EXIT REVIEW" in s
+
+print("ALL OFFLINE CHECKS PASSED")
