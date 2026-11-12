@@ -1,9 +1,12 @@
 streamlit
 pandas
 numpy
+yfinance
 google-genai
 requests
 beautifulsoup4
 lxml
 openpyxl
+xlrd
 pdfplumber
+python-docx
